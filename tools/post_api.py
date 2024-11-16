@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--play",
         type=bool,
-        default=True,
+        default=False,
         help="Whether to play audio after receiving data",
     )
     parser.add_argument("--normalize", type=bool, default=True)

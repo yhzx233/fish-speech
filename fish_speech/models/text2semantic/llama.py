@@ -637,7 +637,8 @@ class DualARTransformer(BaseTransformer):
         self, x: Tensor, input_pos: Optional[Tensor] = None
     ) -> Tensor:
         # Fast transformer
-        x = x.view(1, 1, -1)
+        if x.dim() == 2:
+            x = x.view(1, 1, -1)
 
         fast_mask = self.causal_mask[
             None, None, input_pos, : self.config.num_codebooks
