@@ -71,6 +71,7 @@ from tools.schema import (
     ServeResponse,
     ServeStreamDelta,
     ServeStreamResponse,
+    ServeTTSBatchRequest,
     ServeTextPart,
     ServeTimedASRResponse,
     ServeTTSRequest,
@@ -185,6 +186,7 @@ def decode_vq_tokens(
     decoder_model,
     codes,
 ):
+    print(codes.shape)
     feature_lengths = torch.tensor([codes.shape[1]], device=decoder_model.device)
     logger.info(f"VQ features: {codes.shape}")
 
@@ -271,6 +273,7 @@ def api_vqgan_encode(payload: Annotated[ServeVQGANEncodeRequest, Body(exclusive=
 @torch.no_grad()
 @torch.autocast(device_type="cuda", dtype=torch.half)
 def vqgan_decode(model, features):
+    t0 = time.time()
     lengths = torch.tensor(
         [feature.shape[-1] for feature in features], device=model.device
     )
@@ -284,15 +287,17 @@ def vqgan_decode(model, features):
 
     # If bs too large, we do micro batch decode
     audios, audio_lengths = [], []
-    for i in range(0, padded.shape[0], 8):
+    for i in range(0, padded.shape[0], 1):
         audio, audio_length = model.decode(
-            padded[i : i + 8], feature_lengths=lengths[i : i + 8]
+            padded[i : i + 1], feature_lengths=lengths[i : i + 1]
         )
         audios.append(audio)
         audio_lengths.append(audio_length)
     audios = torch.cat(audios, dim=0)
     audio_lengths = torch.cat(audio_lengths, dim=0)
     audios, audio_lengths = audios.cpu(), audio_lengths.cpu()
+
+    logger.info(f"VQGAN decode time: {(time.time() - t0) * 1000:.2f}ms")
 
     return [audio[..., :length].numpy() for audio, length in zip(audios, audio_lengths)]
 
@@ -690,12 +695,15 @@ def inference(req: ServeTTSRequest):
         with autocast_exclude_mps(
             device_type=decoder_model.device.type, dtype=args.precision
         ):
-            fake_audios = decode_vq_tokens(
-                decoder_model=decoder_model,
-                codes=result.codes,
-            )
+            # fake_audios = decode_vq_tokens(
+            #     decoder_model=decoder_model,
+            #     codes=result.codes,
+            # )
+            fake_audios = vqgan_decode(decoder_model, [result.codes])
 
-        fake_audios = fake_audios.float().cpu().numpy()
+        # fake_audios = fake_audios.float().cpu().numpy()
+        print('fake_audios', fake_audios[0].shape)
+        fake_audios = fake_audios[0][0]
 
         if req.streaming:
             yield (fake_audios * 32768).astype(np.int16).tobytes()
@@ -712,6 +720,127 @@ def inference(req: ServeTTSRequest):
         )
 
     fake_audios = np.concatenate(segments, axis=0)
+    yield fake_audios
+
+@torch.inference_mode()
+def inference_batch(req: ServeTTSBatchRequest):
+
+    global prompt_tokens, prompt_texts
+
+    idstr: str | None = req.reference_id
+    if idstr is not None:
+        ref_folder = Path("references") / idstr
+        ref_folder.mkdir(parents=True, exist_ok=True)
+        ref_audios = list_files(
+            ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
+        )
+
+        if req.use_memory_cache == "never" or (
+            req.use_memory_cache == "on-demand" and len(prompt_tokens) == 0
+        ):  
+            # 检查是否有缓存的 prompt_tokens
+            prompt_tokens = []
+            for ref_audio in ref_audios:
+                cache_path = ref_audio.with_suffix(".npy")
+                if cache_path.exists():
+                    print(f"Load cached prompt tokens from {cache_path}")
+                    prompt_token = np.load(cache_path)
+                    prompt_tokens.append(torch.from_numpy(prompt_token).to(decoder_model.device))
+                else:
+                    prompt_token = encode_reference(
+                        decoder_model=decoder_model,
+                        reference_audio=audio_to_bytes(str(ref_audio)),
+                        enable_reference_audio=True,
+                    )
+                    prompt_tokens.append(prompt_token)
+            prompt_texts = [
+                read_ref_text(str(ref_audio.with_suffix(".lab")))
+                for ref_audio in ref_audios
+            ]
+            # 对每个 ref_audio 缓存 prompt_tokens 的 .npy 到相应目录
+            for ref_audio, prompt_token in zip(ref_audios, prompt_tokens):
+                np.save(ref_audio.with_suffix(".npy"), prompt_token.cpu())
+        else:
+            logger.info("Use same references")
+
+    else:
+        # Parse reference audio aka prompt
+        refs = req.references
+
+        if req.use_memory_cache == "never" or (
+            req.use_memory_cache == "on-demand" and len(prompt_tokens) == 0
+        ):
+            prompt_tokens = [
+                encode_reference(
+                    decoder_model=decoder_model,
+                    reference_audio=ref.audio,
+                    enable_reference_audio=True,
+                )
+                for ref in refs
+            ]
+            prompt_texts = [ref.text for ref in refs]
+        else:
+            logger.info("Use same references")
+
+    if req.seed is not None:
+        set_seed(req.seed)
+        logger.warning(f"set seed: {req.seed}")
+
+    # LLAMA Inference
+    request = dict(
+        device=decoder_model.device,
+        max_new_tokens=req.max_new_tokens,
+        texts=(
+            req.texts
+            if not req.normalize
+            # else ChnNormedText(raw_text=req.text).normalize()
+            else [ChnNormedText(raw_text=text).normalize() for text in req.texts]
+        ),
+        top_p=req.top_p,
+        repetition_penalty=req.repetition_penalty,
+        temperature=req.temperature,
+        compile=args.compile,
+        iterative_prompt=req.chunk_length > 0,
+        chunk_length=req.chunk_length,
+        max_length=4096,
+        prompt_tokens=prompt_tokens,
+        prompt_text=prompt_texts,
+    )
+
+    response_queue = queue.Queue()
+    llama_queue.put(
+        GenerateRequest(
+            request=request,
+            response_queue=response_queue,
+        )
+    )
+
+    if req.streaming:
+        yield wav_chunk_header()
+
+    codes = []
+    while True:
+        result: WrappedGenerateResponse = response_queue.get()
+        if result.status == "error":
+            raise result.response
+            break
+
+        result: GenerateResponse = result.response
+        if result.action == "next":
+            break
+        
+        codes.append(result.codes)
+
+    if len(codes) == 0:
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            content="No audio generated, please check the input text.",
+        )
+    with autocast_exclude_mps(
+        device_type=decoder_model.device.type, dtype=args.precision
+    ):
+        fake_audios = vqgan_decode(decoder_model, codes)
+    fake_audios = np.concatenate(fake_audios, axis=1)[0]
     yield fake_audios
 
 
@@ -754,6 +883,54 @@ async def api_invoke_model(
         )
     else:
         fake_audios = next(inference(req))
+        buffer = io.BytesIO()
+        sf.write(
+            buffer,
+            fake_audios,
+            decoder_model.spec_transform.sample_rate,
+            format=req.format,
+        )
+
+        return StreamResponse(
+            iterable=buffer_to_async_generator(buffer.getvalue()),
+            headers={
+                "Content-Disposition": f"attachment; filename=audio.{req.format}",
+            },
+            content_type=get_content_type(req.format),
+        )
+    
+@routes.http.post("/v1/tts/batch")
+async def api_invoke_model_batch(
+    req: Annotated[ServeTTSBatchRequest, Body(exclusive=True)],
+):
+    """
+    Invoke model and generate audio
+    """
+
+    if args.max_text_length > 0 and len(req.texts[0]) > args.max_text_length:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            content=f"Text is too long, max length is {args.max_text_length}",
+        )
+
+    if req.streaming and req.format != "wav":
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            content="Streaming only supports WAV format",
+        )
+
+    if req.streaming:
+        return StreamResponse(
+            iterable=inference_async(req),
+            headers={
+                "Content-Disposition": f"attachment; filename=audio.{req.format}",
+            },
+            content_type=get_content_type(req.format),
+        )
+    else:
+        # with torch.profiler.profile() as prof:
+        fake_audios = next(inference_batch(req))
+        # prof.export_chrome_trace("trace.json")
         buffer = io.BytesIO()
         sf.write(
             buffer,
@@ -909,12 +1086,12 @@ def initialize_app(app: Kui):
     if args.mode == "tts":
         # Dry run to ensure models work and avoid first-time latency
         list(
-            inference(
-                ServeTTSRequest(
-                    text="Hello world.",
+            inference_batch(
+                ServeTTSBatchRequest(
+                    texts=["Hello world.", "原神，启动"],
                     references=[],
                     reference_id=None,
-                    max_new_tokens=0,
+                    max_new_tokens=10,
                     chunk_length=200,
                     top_p=0.7,
                     repetition_penalty=1.2,

@@ -141,13 +141,14 @@ class KVCache(nn.Module):
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
+        bsz = k_val.shape[0]
 
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
+        k_out[:bsz, :, input_pos] = k_val
+        v_out[:bsz, :, input_pos] = v_val
 
-        return k_out, v_out
+        return k_out[:bsz], v_out[:bsz]
 
 
 @dataclass
@@ -296,6 +297,8 @@ class BaseTransformer(nn.Module):
         self,
         x: Tensor,
         input_pos: Optional[Tensor] = None,
+        padding_mask: Tensor = None,
+        position_ids: Optional[Tensor] = None,
         return_all: bool = False,
     ) -> BaseTransformerForwardResult:
         # This is used for generation, optimized for torch compile
@@ -308,7 +311,18 @@ class BaseTransformer(nn.Module):
         mask = self.causal_mask[
             None, None, input_pos, : self.max_seq_len
         ]  # (B, N, Q, K)
-        freqs_cis = self.freqs_cis[input_pos]
+        if padding_mask is not None:
+            mask = mask & padding_mask[:, None, None, :].logical_not()
+            # prevent nan in softmax
+            mask = torch.where(mask, torch.tensor(0.0, dtype=x.dtype), torch.finfo(x.dtype).min)
+            # print(mask[:, :, :, :10])
+        if False and position_ids is not None:
+            # print(torch.gather(position_ids, -1, input_pos[None].expand(position_ids.size(0), -1)))
+            freqs_cis = self.freqs_cis[
+                torch.gather(position_ids, -1, input_pos[None].expand(position_ids.size(0), -1))
+            ]
+        else:
+            freqs_cis = self.freqs_cis[input_pos]
 
         for layer in self.layers:
             x = layer(x, freqs_cis, mask, input_pos=input_pos)
@@ -655,9 +669,9 @@ class DualARTransformer(BaseTransformer):
         return codebook_logits
 
     def forward_generate(
-        self, x: Tensor, input_pos: Optional[Tensor] = None
+        self, x: Tensor, input_pos: Optional[Tensor] = None, padding_mask: Tensor = None, position_ids: Optional[Tensor] = None
     ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos)
+        x = super().forward_generate(x, input_pos, padding_mask, position_ids)
         x.hidden_states = self.fast_project_in(x.hidden_states)
         return x
 
@@ -832,7 +846,10 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    if freqs_cis.dim() == 3:
+        freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    else:
+        freqs_cis = freqs_cis.view(xshaped.size(0), xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],

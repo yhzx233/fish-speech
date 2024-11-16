@@ -9,7 +9,7 @@ from pydub import AudioSegment
 from pydub.playback import play
 
 from tools.file import audio_to_bytes, read_ref_text
-from tools.schema import ServeReferenceAudio, ServeTTSRequest
+from tools.schema import ServeReferenceAudio, ServeTTSBatchRequest, ServeTTSRequest
 
 
 def parse_args():
@@ -27,7 +27,7 @@ def parse_args():
         help="URL of the server",
     )
     parser.add_argument(
-        "--text", "-t", type=str, required=True, help="Text to be synthesized"
+        "--text", "-t", type=str, required=True, help="Text to be synthesized", nargs="+"
     )
     parser.add_argument(
         "--reference_id",
@@ -152,7 +152,7 @@ if __name__ == "__main__":
         pass  # in api.py
 
     data = {
-        "text": args.text,
+        "texts": args.text,
         "references": [
             ServeReferenceAudio(audio=ref_audio, text=ref_text)
             for ref_text, ref_audio in zip(ref_texts, byte_audios)
@@ -172,7 +172,7 @@ if __name__ == "__main__":
         "seed": args.seed,
     }
 
-    pydantic_data = ServeTTSRequest(**data)
+    pydantic_data = ServeTTSBatchRequest(**data)
 
     response = requests.post(
         args.url,
