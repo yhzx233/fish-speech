@@ -840,7 +840,10 @@ def inference_batch(req: ServeTTSBatchRequest):
         device_type=decoder_model.device.type, dtype=args.precision
     ):
         fake_audios = vqgan_decode(decoder_model, codes)
-    fake_audios = np.concatenate(fake_audios, axis=1)[0]
+    # fake_audios = np.concatenate(fake_audios, axis=1)[0]
+    # yield fake_audios
+    # audios = [audio.astype(np.float16).tobytes() for audio in audios]
+    # fake_audios = [audio.astype(np.float16).tobytes() for audio in fake_audios]
     yield fake_audios
 
 
@@ -929,22 +932,28 @@ async def api_invoke_model_batch(
         )
     else:
         # with torch.profiler.profile() as prof:
-        fake_audios = next(inference_batch(req))
+        audios = next(inference_batch(req))
         # prof.export_chrome_trace("trace.json")
-        buffer = io.BytesIO()
-        sf.write(
-            buffer,
-            fake_audios,
-            decoder_model.spec_transform.sample_rate,
-            format=req.format,
-        )
+        audios_bin = []
+        for audio in audios:
+            buffer = io.BytesIO()
+            sf.write(
+                buffer,
+                audio[0],
+                decoder_model.spec_transform.sample_rate,
+                format=req.format,
+            )
+            audios_bin.append(buffer.getvalue())
 
-        return StreamResponse(
-            iterable=buffer_to_async_generator(buffer.getvalue()),
-            headers={
-                "Content-Disposition": f"attachment; filename=audio.{req.format}",
-            },
-            content_type=get_content_type(req.format),
+        # return StreamResponse(
+        #     iterable=buffer_to_async_generator(buffer.getvalue()),
+        #     headers={
+        #         "Content-Disposition": f"attachment; filename=audio.{req.format}",
+        #     },
+        #     content_type=get_content_type(req.format),
+        # )
+        return ormsgpack.packb(
+            ServeVQGANDecodeResponse(audios=audios_bin), option=ormsgpack.OPT_SERIALIZE_PYDANTIC
         )
 
 

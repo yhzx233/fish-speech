@@ -38,7 +38,7 @@ from fish_speech.models.text2semantic.llama import (
     NaiveTransformer,
 )
 
-MAX_BATCH_SIZE = 256
+MAX_BATCH_SIZE = 64
 
 def multinomial_sample_one_no_sync(
     probs_sort,
@@ -933,7 +933,7 @@ def generate_long_batch(
     assert 0 < repetition_penalty < 2, "repetition_penalty must be in (0, 2)"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
-    texts = texts * 128
+    texts = texts * 1
 
     # texts = ["两个长度不同的能不能正常生成呢？", "两个长度不同的能不能正常生成呢？"]
 

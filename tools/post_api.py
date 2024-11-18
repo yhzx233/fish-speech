@@ -214,14 +214,24 @@ if __name__ == "__main__":
                 wf.close()
         else:
             audio_content = response.content
-            audio_path = f"{args.output}.{args.format}"
-            with open(audio_path, "wb") as audio_file:
-                audio_file.write(audio_content)
+            response_data = ormsgpack.unpackb(audio_content)
+            audios = response_data["audios"]
+            # 遍历每个音频数据，直接保存为独立的文件
+            for i, audio_bytes in enumerate(audios):
+                # 保存为文件，文件名为 generated_audio_{i}.wav
+                audio_path = f"generated_audio_{i}.{args.format}"
+                with open(audio_path, "wb") as audio_file:
+                    audio_file.write(audio_bytes)  # 直接写入二进制音频数据
+                print(f"Audio has been saved to '{audio_path}'.")
 
-            audio = AudioSegment.from_file(audio_path, format=args.format)
-            if args.play:
-                play(audio)
-            print(f"Audio has been saved to '{audio_path}'.")
+            # audio_path = f"{args.output}.{args.format}"
+            # with open(audio_path, "wb") as audio_file:
+            #     audio_file.write(audio_content)
+
+            # audio = AudioSegment.from_file(audio_path, format=args.format)
+            # if args.play:
+            #     play(audio)
+            # print(f"Audio has been saved to '{audio_path}'.")
     else:
         print(f"Request failed with status code {response.status_code}")
         print(response.json())
