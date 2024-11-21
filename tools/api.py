@@ -287,9 +287,9 @@ def vqgan_decode(model, features):
 
     # If bs too large, we do micro batch decode
     audios, audio_lengths = [], []
-    for i in range(0, padded.shape[0], 1):
+    for i in range(0, padded.shape[0], 8):
         audio, audio_length = model.decode(
-            padded[i : i + 1], feature_lengths=lengths[i : i + 1]
+            padded[i : i + 8], feature_lengths=lengths[i : i + 8]
         )
         audios.append(audio)
         audio_lengths.append(audio_length)
@@ -985,6 +985,7 @@ def parse_args():
     parser.add_argument("--half", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-text-length", type=int, default=0)
+    parser.add_argument("--max-batch-size", type=int, default=64)
     parser.add_argument("--listen", type=str, default="127.0.0.1:8080")
     parser.add_argument("--workers", type=int, default=1)
 
@@ -1069,6 +1070,7 @@ def initialize_app(app: Kui):
             device=args.device,
             precision=args.precision,
             compile=args.compile,
+            max_batch_size=args.max_batch_size,
         )
     else:
         llama_queue, tokenizer, config = launch_thread_safe_queue_agent(
@@ -1097,10 +1099,10 @@ def initialize_app(app: Kui):
         list(
             inference_batch(
                 ServeTTSBatchRequest(
-                    texts=["Hello world.", "原神，启动"],
+                    texts=["Hello world." * 10, "原神，启动" * 10],
                     references=[],
                     reference_id=None,
-                    max_new_tokens=10,
+                    max_new_tokens=1000,
                     chunk_length=200,
                     top_p=0.7,
                     repetition_penalty=1.2,

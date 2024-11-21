@@ -38,7 +38,6 @@ from fish_speech.models.text2semantic.llama import (
     NaiveTransformer,
 )
 
-MAX_BATCH_SIZE = 64
 
 def multinomial_sample_one_no_sync(
     probs_sort,
@@ -180,6 +179,7 @@ def decode_one_token_ar_agent(
             [codebook_idx], device=hidden_states.device, dtype=torch.long
         )
         logits = model.forward_generate_fast(hidden_states, input_pos)
+        # print(logits.shape, previous_tokens.shape if previous_tokens is not None else "")
         a = sample_agent(
             logits,
             previous_tokens=(
@@ -378,7 +378,7 @@ def decode_n_tokens(
                 model=model,
                 x=cur_token,
                 input_pos=input_pos,
-                previous_tokens=window,
+                previous_tokens=window[None],
                 semantic_id=semantic_id,
                 **sampling_kwargs,
             )
@@ -388,7 +388,6 @@ def decode_n_tokens(
         previous_tokens[:, i : i + 1] = next_token.view(
             model.config.num_codebooks + 1, -1
         )
-        print(cur_token)
 
         if cur_token[0, 0, -1] == im_end_id:
             break
@@ -581,7 +580,7 @@ def generate_agent(
     codebook_dim = 1 + model.config.num_codebooks
     input_pos = torch.arange(0, T, device=device)
     position_ids = padding_mask.logical_not().cumsum(dim=-1) - 1
-    print(position_ids)
+    # print(position_ids)
 
     # Use non-accelerated version for now, to avoid compilation overhead
     prefill_decode = (
@@ -978,7 +977,7 @@ def generate_long_batch(
             )
         )
     logger.info(f"Encoded text: {texts}")
-    print(encode_tokens_batch(tokenizer, texts, device=device, num_codebooks=model.config.num_codebooks))
+    # print(encode_tokens_batch(tokenizer, texts, device=device, num_codebooks=model.config.num_codebooks))
 
     # Move temperature, top_p, repetition_penalty to device
     # This is important so that changing params doesn't trigger recompile
@@ -1136,6 +1135,7 @@ def launch_thread_safe_queue(
     device,
     precision,
     compile: bool = False,
+    max_batch_size: int = 64,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
@@ -1146,7 +1146,7 @@ def launch_thread_safe_queue(
         )
         with torch.device(device):
             model.setup_caches(
-                max_batch_size=MAX_BATCH_SIZE,
+                max_batch_size=max_batch_size,
                 max_seq_len=model.config.max_seq_len,
                 dtype=next(model.parameters()).dtype,
             )
@@ -1160,8 +1160,10 @@ def launch_thread_safe_queue(
             kwargs = item.request
             response_queue = item.response_queue
 
+            generate_fn = generate_long_batch if "texts" in kwargs else generate_long
+
             try:
-                for chunk in generate_long_batch(
+                for chunk in generate_fn(
                     model=model, decode_one_token=decode_one_token, **kwargs
                 ):
                     response_queue.put(
