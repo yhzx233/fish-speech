@@ -1,5 +1,6 @@
 import argparse
 import base64
+import pickle
 import wave
 
 import ormsgpack
@@ -33,6 +34,7 @@ def parse_args():
         "--reference_id",
         "-id",
         type=str,
+        nargs="+",
         default=None,
         help="ID of the reference model to be used for the speech\n(Local: name of folder containing audios and files)",
     )
@@ -67,7 +69,7 @@ def parse_args():
     )
     parser.add_argument("--normalize", type=bool, default=True)
     parser.add_argument(
-        "--format", type=str, choices=["wav", "mp3", "flac"], default="wav"
+        "--format", type=str, choices=["wav", "mp3", "flac", "token"], default="wav"
     )
     parser.add_argument(
         "--mp3_bitrate", type=int, choices=[64, 128, 192], default=64, help="kHz"
@@ -214,24 +216,18 @@ if __name__ == "__main__":
                 wf.close()
         else:
             audio_content = response.content
-            response_data = ormsgpack.unpackb(audio_content)
-            audios = response_data["audios"]
-            # 遍历每个音频数据，直接保存为独立的文件
-            for i, audio_bytes in enumerate(audios):
-                # 保存为文件，文件名为 generated_audio_{i}.wav
-                audio_path = f"generated_audio_{i}.{args.format}"
-                with open(audio_path, "wb") as audio_file:
-                    audio_file.write(audio_bytes)  # 直接写入二进制音频数据
-                print(f"Audio has been saved to '{audio_path}'.")
-
-            # audio_path = f"{args.output}.{args.format}"
-            # with open(audio_path, "wb") as audio_file:
-            #     audio_file.write(audio_content)
-
-            # audio = AudioSegment.from_file(audio_path, format=args.format)
-            # if args.play:
-            #     play(audio)
-            # print(f"Audio has been saved to '{audio_path}'.")
+            if args.format == "token":
+                print(pickle.loads(audio_content))
+            else:
+                response_data = ormsgpack.unpackb(audio_content)
+                audios = response_data["audios"]
+                # 遍历每个音频数据，直接保存为独立的文件
+                for i, audio_bytes in enumerate(audios):
+                    # 保存为文件，文件名为 generated_audio_{i}.wav
+                    audio_path = f"generated_audio_{i}.{args.format}"
+                    with open(audio_path, "wb") as audio_file:
+                        audio_file.write(audio_bytes)  # 直接写入二进制音频数据
+                    print(f"Audio has been saved to '{audio_path}'.")
     else:
         print(f"Request failed with status code {response.status_code}")
         print(response.json())
