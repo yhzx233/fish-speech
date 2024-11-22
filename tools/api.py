@@ -603,7 +603,7 @@ def inference(req: ServeTTSRequest):
 
     idstr: str | None = req.reference_id
     if idstr is not None:
-        ref_folder = Path("references") / idstr
+        ref_folder = Path(args.reference_path) / idstr
         ref_folder.mkdir(parents=True, exist_ok=True)
         ref_audios = list_files(
             ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
@@ -727,13 +727,23 @@ def inference_batch(req: ServeTTSBatchRequest):
 
     global prompt_tokens, prompt_texts
 
-    idstr: str | None = req.reference_id
-    if idstr is not None:
-        ref_folder = Path("references") / idstr
+    ids_str: list[str] | str | None = req.reference_id
+    if isinstance(ids_str, str):
+        ids_str = [ids_str]
+    if ids_str is None:
+        ids_str = []
+
+    batch_prompt_tokens = []
+    batch_prompt_texts = []
+
+    t_0 = time.time()
+    
+    for idstr in ids_str:
+        ref_folder = Path(args.reference_path) / idstr
         ref_folder.mkdir(parents=True, exist_ok=True)
         ref_audios = list_files(
             ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
-        )
+        )[:1] # 先只拿前三个
 
         if req.use_memory_cache == "never" or (
             req.use_memory_cache == "on-demand" and len(prompt_tokens) == 0
@@ -763,7 +773,13 @@ def inference_batch(req: ServeTTSBatchRequest):
         else:
             logger.info("Use same references")
 
-    else:
+        batch_prompt_tokens.append(prompt_tokens)
+        batch_prompt_texts.append(prompt_texts)
+
+    if len(ids_str) != 0:
+        logger.info(f"Load reference audio time: {(time.time() - t_0) * 1000:.2f}ms")
+
+    if len(ids_str) == 0:
         # Parse reference audio aka prompt
         refs = req.references
 
@@ -781,6 +797,9 @@ def inference_batch(req: ServeTTSBatchRequest):
             prompt_texts = [ref.text for ref in refs]
         else:
             logger.info("Use same references")
+
+        batch_prompt_tokens.append(prompt_tokens)
+        batch_prompt_texts.append(prompt_texts)
 
     if req.seed is not None:
         set_seed(req.seed)
@@ -803,8 +822,8 @@ def inference_batch(req: ServeTTSBatchRequest):
         iterative_prompt=req.chunk_length > 0,
         chunk_length=req.chunk_length,
         max_length=4096,
-        prompt_tokens=prompt_tokens,
-        prompt_text=prompt_texts,
+        batch_prompt_tokens=batch_prompt_tokens,
+        batch_prompt_texts=batch_prompt_texts,
     )
 
     response_queue = queue.Queue()
@@ -981,6 +1000,7 @@ def parse_args():
         default="checkpoints/fish-speech-1.4/firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
     )
     parser.add_argument("--decoder-config-name", type=str, default="firefly_gan_vq")
+    parser.add_argument("--reference-path", type=str, default="references")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--half", action="store_true")
     parser.add_argument("--compile", action="store_true")
@@ -1099,7 +1119,7 @@ def initialize_app(app: Kui):
         list(
             inference_batch(
                 ServeTTSBatchRequest(
-                    texts=["Hello world." * 10, "原神，启动" * 10],
+                    texts=["Hello world." * 1, "原神，启动" * 1],
                     references=[],
                     reference_id=None,
                     max_new_tokens=1000,

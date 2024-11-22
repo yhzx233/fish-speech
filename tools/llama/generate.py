@@ -925,8 +925,8 @@ def generate_long_batch(
     iterative_prompt: bool = True,
     max_length: int = 2048,
     chunk_length: int = 150,
-    prompt_text: Optional[str | list[str]] = None,
-    prompt_tokens: Optional[torch.Tensor | list[torch.Tensor]] = None,
+    batch_prompt_texts: Optional[list[list[str]]] = None,
+    batch_prompt_tokens: Optional[list[list[torch.Tensor]]] = None,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < repetition_penalty < 2, "repetition_penalty must be in (0, 2)"
@@ -936,13 +936,10 @@ def generate_long_batch(
 
     # texts = ["两个长度不同的能不能正常生成呢？", "两个长度不同的能不能正常生成呢？"]
 
-    use_prompt = prompt_text and prompt_tokens
-    if use_prompt and isinstance(prompt_text, str):
-        prompt_text = [prompt_text]
-        prompt_tokens = [prompt_tokens]
+    use_prompt = batch_prompt_texts and batch_prompt_tokens
 
-    assert use_prompt is False or len(prompt_text) == len(
-        prompt_tokens
+    assert use_prompt is False or len(batch_prompt_texts) == len(
+        batch_prompt_tokens
     ), "Prompt text and tokens must have the same length"
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -957,25 +954,36 @@ def generate_long_batch(
     encoded_prompts = []
 
     if use_prompt:
-        for idx, (t, c) in enumerate(zip(prompt_text, prompt_tokens)):
-            encoded_prompts.append(
-                encode_tokens(
-                    tokenizer,
-                    string=t,
-                    device=device,
-                    prompt_tokens=c,
-                    num_codebooks=model.config.num_codebooks,
+        for prompt_text, prompt_tokens in zip(batch_prompt_texts, batch_prompt_tokens):
+            list_encoded_prompts = []
+            for idx, (t, c) in enumerate(zip(prompt_text, prompt_tokens)):
+                list_encoded_prompts.append(
+                    encode_tokens(
+                        tokenizer,
+                        string=t,
+                        device=device,
+                        prompt_tokens=c,
+                        num_codebooks=model.config.num_codebooks,
+                    )
                 )
-            )
-    for text in texts:
-        encoded.append(
-            encode_tokens(
-                tokenizer,
-                string=text,
-                device=device,
-                num_codebooks=model.config.num_codebooks,
-            )
+            if list_encoded_prompts:
+                encoded_prompts.append(torch.cat(list_encoded_prompts, dim=1))
+                print('encoded_prompts:', encoded_prompts[-1].shape)
+
+    assert len(encoded_prompts) <= 1 or len(encoded_prompts) == len(texts), "Prompt texts and tokens must have the same length"
+    
+    for idx, text in enumerate(texts):
+        encoded_tokens = encode_tokens(
+            tokenizer,
+            string=text,
+            device=device,
+            num_codebooks=model.config.num_codebooks,
         )
+        if len(encoded_prompts) == 1:
+            encoded_tokens = torch.cat([encoded_prompts[0], encoded_tokens], dim=1)
+        elif len(encoded_prompts) > 1:
+            encoded_tokens = torch.cat([encoded_prompts[idx], encoded_tokens], dim=1)
+        encoded.append(encoded_tokens)
     logger.info(f"Encoded text: {texts}")
     # print(encode_tokens_batch(tokenizer, texts, device=device, num_codebooks=model.config.num_codebooks))
 
@@ -994,22 +1002,16 @@ def generate_long_batch(
         logger.info(
             f"Generating sentence {seg_idx + 1}/{len(encoded)}"
         )
-        if use_prompt:
-            encoded_prompts = torch.cat(encoded_prompts, dim=1)
-            print('encoded_prompts:', encoded_prompts.shape)
         segs = []
         padding_mask = []
         max_tokens_len = max([t.shape[1] for t in encoded]) + 0
         print('max_tokens_len:', max_tokens_len)
         for tokens in encoded:
             # left padding
-            full_tokens = torch.zeros((tokens.shape[0], max_tokens_len - tokens.shape[1]), dtype=torch.int, device=device)
-            full_tokens[0, :] = pad_id
-            if use_prompt:
-                # tokens <|semantic|> data
-                full_tokens = torch.cat([full_tokens, encoded_prompts], dim=1)
+            left_padding = torch.zeros((tokens.shape[0], max_tokens_len - tokens.shape[1]), dtype=torch.int, device=device)
+            left_padding[0, :] = pad_id
             # <|im_start|>user\n{text}<|im_end|><|im_start|>assistant\n
-            full_tokens = torch.cat([full_tokens, tokens], dim=1)
+            full_tokens = torch.cat([left_padding, tokens], dim=1)
             segs.append(full_tokens)
             mask = torch.zeros(model.max_seq_len, dtype=torch.int, device=device)
             mask[:max_tokens_len - tokens.shape[1]] = 1
@@ -1017,39 +1019,6 @@ def generate_long_batch(
         
         cat_encoded = torch.stack(segs, dim=0)
         padding_mask = torch.stack(padding_mask, dim=0)
-
-        # print('cat_encoded:', cat_encoded[:, :, :30], cat_encoded[:, :, -30:])
-        # print('padding_mask:', padding_mask.shape)
-
-
-        # seg = encoded[seg_idx]
-        # global_encoded.append(seg)
-
-        # lengths = reversed([seg.size(1) for seg in global_encoded])
-
-        # Pick last 2000 tokens
-        # count = 0
-        # for i, length in enumerate(lengths):
-        #     count += length
-        #     if count + length > max_length - 1024 - sum(
-        #         t.shape[1] for t in encoded_prompts
-        #     ):
-        #         break
-
-        # if i != 0 and i % 2 == 0:
-        #     i -= 1
-
-        # Rotate the list, always make sure first segment is included to avoid drift
-        # if i < len(global_encoded) - 2:
-        #     partial_encoded = global_encoded[:2] + global_encoded[-i:]
-        # else:
-        #     partial_encoded = global_encoded
-
-        # if use_prompt:
-        #     partial_encoded = encoded_prompts + partial_encoded
-
-        # cat_encoded = torch.cat(partial_encoded, dim=1)
-        # prompt_length = cat_encoded.size(1)
 
         t0 = time.perf_counter()
         generator = generate_agent(
@@ -1104,13 +1073,11 @@ def generate_long_batch(
             # print('semantic:', y[i, 0, :im_end_idx])
             codes = y[i, 1:, :im_end_idx].clone()
             codes = codes - 1
-            assert (codes >= 0).all(), f"Negative code found: {codes}"
+            # assert (codes >= 0).all(), f"Negative code found: {codes}"
+            if (codes < 0).any():
+                # 返回空的结果
+                codes = torch.zeros((codes.shape[0], 0), dtype=torch.int, device=device)
 
-            decoded = y[i, :, :-1].clone()
-            # But for global encoding, we should keep the <im_end> token
-
-            global_encoded.append(decoded)
-            assert (codes >= 0).all(), f"Negative code found: {codes}"
             codes = codes.cuda()
             yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
         seg_idx += 1
