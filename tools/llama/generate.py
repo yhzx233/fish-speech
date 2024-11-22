@@ -968,7 +968,7 @@ def generate_long_batch(
                 )
             if list_encoded_prompts:
                 encoded_prompts.append(torch.cat(list_encoded_prompts, dim=1))
-                print('encoded_prompts:', encoded_prompts[-1].shape)
+                # print('encoded_prompts:', encoded_prompts[-1].shape)
 
     assert len(encoded_prompts) <= 1 or len(encoded_prompts) == len(texts), "Prompt texts and tokens must have the same length"
     

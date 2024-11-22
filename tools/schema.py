@@ -190,7 +190,7 @@ class ServeTTSBatchRequest(BaseModel):
     texts: list[str]
     chunk_length: Annotated[int, conint(ge=100, le=300, strict=True)] = 200
     # Audio format
-    format: Literal["wav", "pcm", "mp3"] = "wav"
+    format: Literal["wav", "pcm", "mp3", "token"] = "wav"
     mp3_bitrate: Literal[64, 128, 192] = 128
     # References audios for in-context learning
     references: list[ServeReferenceAudio] = []

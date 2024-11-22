@@ -1,5 +1,6 @@
 import io
 import os
+import pickle
 import queue
 import re
 import time
@@ -834,10 +835,7 @@ def inference_batch(req: ServeTTSBatchRequest):
         )
     )
 
-    if req.streaming:
-        yield wav_chunk_header()
-
-    codes = []
+    codes : list[torch.Tensor] = []
     while True:
         result: WrappedGenerateResponse = response_queue.get()
         if result.status == "error":
@@ -855,15 +853,14 @@ def inference_batch(req: ServeTTSBatchRequest):
             HTTPStatus.INTERNAL_SERVER_ERROR,
             content="No audio generated, please check the input text.",
         )
-    with autocast_exclude_mps(
-        device_type=decoder_model.device.type, dtype=args.precision
-    ):
-        fake_audios = vqgan_decode(decoder_model, codes)
-    # fake_audios = np.concatenate(fake_audios, axis=1)[0]
-    # yield fake_audios
-    # audios = [audio.astype(np.float16).tobytes() for audio in audios]
-    # fake_audios = [audio.astype(np.float16).tobytes() for audio in fake_audios]
-    yield fake_audios
+    if req.format != "token":
+        with autocast_exclude_mps(
+            device_type=decoder_model.device.type, dtype=args.precision
+        ):
+            fake_audios = vqgan_decode(decoder_model, codes)
+        yield fake_audios
+    else:
+        yield codes
 
 
 async def inference_async(req: ServeTTSRequest):
@@ -935,26 +932,21 @@ async def api_invoke_model_batch(
             content=f"Text is too long, max length is {args.max_text_length}",
         )
 
-    if req.streaming and req.format != "wav":
+    if req.streaming:
         raise HTTPException(
             HTTPStatus.BAD_REQUEST,
-            content="Streaming only supports WAV format",
+            content="Batch mode does not support streaming",
         )
 
-    if req.streaming:
-        return StreamResponse(
-            iterable=inference_async(req),
-            headers={
-                "Content-Disposition": f"attachment; filename=audio.{req.format}",
-            },
-            content_type=get_content_type(req.format),
-        )
-    else:
-        # with torch.profiler.profile() as prof:
-        audios = next(inference_batch(req))
-        # prof.export_chrome_trace("trace.json")
+    # with torch.profiler.profile() as prof:
+    results = next(inference_batch(req))
+    # prof.export_chrome_trace("trace.json")
+    if req.format != "token":
         audios_bin = []
-        for audio in audios:
+        for audio in results:
+            if audio.shape[-1] == 0:
+                audios_bin.append(b"")
+                continue
             buffer = io.BytesIO()
             sf.write(
                 buffer,
@@ -964,16 +956,12 @@ async def api_invoke_model_batch(
             )
             audios_bin.append(buffer.getvalue())
 
-        # return StreamResponse(
-        #     iterable=buffer_to_async_generator(buffer.getvalue()),
-        #     headers={
-        #         "Content-Disposition": f"attachment; filename=audio.{req.format}",
-        #     },
-        #     content_type=get_content_type(req.format),
-        # )
         return ormsgpack.packb(
             ServeVQGANDecodeResponse(audios=audios_bin), option=ormsgpack.OPT_SERIALIZE_PYDANTIC
         )
+    else:
+        codes = [code.cpu() for code in results]
+        return pickle.dumps(codes)
 
 
 @routes.http.post("/v1/health")
