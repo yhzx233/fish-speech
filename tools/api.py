@@ -274,25 +274,42 @@ def api_vqgan_encode(payload: Annotated[ServeVQGANEncodeRequest, Body(exclusive=
 @torch.no_grad()
 @torch.autocast(device_type="cuda", dtype=torch.half)
 def vqgan_decode(model, features):
+    # 把 features 用 pickle 存储到 features/pid.pkl
+    # pid = os.getpid()
+    # os.makedirs("features", exist_ok=True)
+    # with open(f'features/{pid}.pkl', 'wb') as f:
+    #     pickle.dump(features, f)
+    # logger.info(f"features saved to features/{pid}.pkl")
     t0 = time.time()
     lengths = torch.tensor(
         [feature.shape[-1] for feature in features], device=model.device
     )
     max_length = lengths.max().item()
+    if max_length == 0:
+        return [np.array([[]]) for _ in range(len(features))]
     padded = torch.stack(
         [
             torch.nn.functional.pad(feature, (0, max_length - feature.shape[-1]))
             for feature in features
         ]
     ).to(model.device)
+    # # temperal fix for the bug in the model
+    # padded = torch.clamp(padded, 0, 999)
 
     # If bs too large, we do micro batch decode
     audios, audio_lengths = [], []
-    for i in range(0, padded.shape[0], 8):
+    batch_size = 8
+    for i in range(0, padded.shape[0], batch_size):
+        # all_zero_length = max(lengths[i : i + batch_size]) == 0
+        # if all_zero_length:
+        #     logger.warning(f"Zero length audio at {i}")
+        #     lengths[i : i + batch_size] = 1
         audio, audio_length = model.decode(
-            padded[i : i + 8], feature_lengths=lengths[i : i + 8]
+            padded[i : i + batch_size], feature_lengths=lengths[i : i + batch_size]
         )
         audios.append(audio)
+        # if all_zero_length:
+        #     audio_length = torch.zeros_like(audio_length)
         audio_lengths.append(audio_length)
     audios = torch.cat(audios, dim=0)
     audio_lengths = torch.cat(audio_lengths, dim=0)
@@ -300,7 +317,15 @@ def vqgan_decode(model, features):
 
     logger.info(f"VQGAN decode time: {(time.time() - t0) * 1000:.2f}ms")
 
-    return [audio[..., :length].numpy() for audio, length in zip(audios, audio_lengths)]
+    audios = [audio[..., :length] for audio, length in zip(audios, audio_lengths)]
+    # 下采样到 24kHz
+    t0 = time.time()
+    resampler = torchaudio.transforms.Resample(
+        orig_freq=model.spec_transform.sample_rate, new_freq=24000
+    )
+    audios = [resampler(audio) if audio.shape[-1] > 0 else audio for audio in audios]
+    logger.info(f"VQGAN resample time: {(time.time() - t0) * 1000:.2f}ms")
+    return [audio.numpy() for audio in audios]
 
 
 @routes.http.post("/v1/vqgan/decode")
@@ -723,6 +748,41 @@ def inference(req: ServeTTSRequest):
     fake_audios = np.concatenate(segments, axis=0)
     yield fake_audios
 
+
+@cached(
+    cache=LRUCache(maxsize=10000),
+    key=lambda path, decoder_model: path,
+)
+def get_prompt_token_and_text(ref_audio_path: str, decoder_model):
+    """
+    获取单个参考音频的 prompt_token 和文本。如果缓存中存在 token，则直接加载。
+    如果不存在，则生成 token 并存储。
+
+    :param ref_audio_path: 参考音频路径
+    :param decoder_model: 解码模型
+    :return: prompt_token, prompt_text
+    """
+    ref_audio = Path(ref_audio_path)
+    cache_path = ref_audio.with_suffix(".npy")
+    
+    if cache_path.exists():
+        # 从缓存加载
+        prompt_token = torch.from_numpy(np.load(cache_path)).to(decoder_model.device)
+    else:
+        # 计算并缓存
+        prompt_token = encode_reference(
+            decoder_model=decoder_model,
+            reference_audio=audio_to_bytes(str(ref_audio)),
+            enable_reference_audio=True,
+        )
+        np.save(cache_path, prompt_token.cpu())
+    
+    # 读取文本标签
+    prompt_text = read_ref_text(str(ref_audio.with_suffix(".lab")))
+    
+    return prompt_token, prompt_text
+
+
 @torch.inference_mode()
 def inference_batch(req: ServeTTSBatchRequest):
 
@@ -751,26 +811,11 @@ def inference_batch(req: ServeTTSBatchRequest):
         ):  
             # 检查是否有缓存的 prompt_tokens
             prompt_tokens = []
+            prompt_texts = []
             for ref_audio in ref_audios:
-                cache_path = ref_audio.with_suffix(".npy")
-                if cache_path.exists():
-                    print(f"Load cached prompt tokens from {cache_path}")
-                    prompt_token = np.load(cache_path)
-                    prompt_tokens.append(torch.from_numpy(prompt_token).to(decoder_model.device))
-                else:
-                    prompt_token = encode_reference(
-                        decoder_model=decoder_model,
-                        reference_audio=audio_to_bytes(str(ref_audio)),
-                        enable_reference_audio=True,
-                    )
-                    prompt_tokens.append(prompt_token)
-            prompt_texts = [
-                read_ref_text(str(ref_audio.with_suffix(".lab")))
-                for ref_audio in ref_audios
-            ]
-            # 对每个 ref_audio 缓存 prompt_tokens 的 .npy 到相应目录
-            for ref_audio, prompt_token in zip(ref_audios, prompt_tokens):
-                np.save(ref_audio.with_suffix(".npy"), prompt_token.cpu())
+                prompt_token, prompt_text = get_prompt_token_and_text(str(ref_audio), decoder_model)
+                prompt_tokens.append(prompt_token)
+                prompt_texts.append(prompt_text)
         else:
             logger.info("Use same references")
 
@@ -951,7 +996,7 @@ async def api_invoke_model_batch(
             sf.write(
                 buffer,
                 audio[0],
-                decoder_model.spec_transform.sample_rate,
+                24000, # decoder_model.spec_transform.sample_rate,
                 format=req.format,
             )
             audios_bin.append(buffer.getvalue())

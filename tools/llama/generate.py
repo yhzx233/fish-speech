@@ -1074,7 +1074,8 @@ def generate_long_batch(
             codes = y[i, 1:, :im_end_idx].clone()
             codes = codes - 1
             # assert (codes >= 0).all(), f"Negative code found: {codes}"
-            if (codes < 0).any():
+            # assert (codes < 1000).all(), f"Invalid code found: {codes}"
+            if (codes < 0).any() or (codes >= 1000).any():
                 # 返回空的结果
                 codes = torch.zeros((codes.shape[0], 0), dtype=torch.int, device=device)
 
