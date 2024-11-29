@@ -314,7 +314,9 @@ class BaseTransformer(nn.Module):
         if padding_mask is not None:
             mask = mask & padding_mask[:, None, None, :].logical_not()
             # prevent nan in softmax
-            mask = torch.where(mask, torch.tensor(0.0, dtype=x.dtype), torch.finfo(x.dtype).min)
+            min_dtype = torch.finfo(x.dtype).min
+            mask = torch.where(mask, torch.tensor(0.0, dtype=x.dtype), min_dtype)
+            mask = self._unmask_unattended(mask, min_dtype)
             # print(mask[:, :, :, :10])
         if False and position_ids is not None:
             # print(torch.gather(position_ids, -1, input_pos[None].expand(position_ids.size(0), -1)))
@@ -343,6 +345,14 @@ class BaseTransformer(nn.Module):
             logits=token_logits,
             hidden_states=x,
         )
+
+    @staticmethod
+    def _unmask_unattended(
+        expanded_mask: torch.FloatTensor,
+        min_dtype: float,
+    ):
+        # https://github.com/huggingface/transformers/blob/f7427f58edc8dfb74094a82416347f7c190f1ceb/src/transformers/modeling_attn_mask_utils.py#L191
+        return expanded_mask.mul(~torch.all(expanded_mask == min_dtype, dim=-1, keepdim=True))
 
     def _init_weights(self, module):
         std = self.config.initializer_range
