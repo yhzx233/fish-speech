@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import pickle
 import queue
@@ -33,7 +34,6 @@ from kui.asgi import (
 )
 from kui.asgi.routing import MultimethodRoutes
 from loguru import logger
-from transformers import AutoTokenizer
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 import struct
@@ -44,12 +44,14 @@ from cachetools import LRUCache, cached
 from funasr import AutoModel
 from silero_vad import get_speech_timestamps, load_silero_vad
 
-from fish_speech.conversation import IM_END_TOKEN, SEMANTIC_TOKEN
 from fish_speech.models.text2semantic.llama import BaseModelArgs
 
 # from fish_speech.models.vqgan.lit_module import VQGAN
 from fish_speech.models.vqgan.modules.firefly import FireflyArchitecture
 from fish_speech.text.chn_text_norm.text import Text as ChnNormedText
+
+# from fish_speech.conversation import IM_END_TOKEN, SEMANTIC_TOKEN
+from fish_speech.tokenizer import IM_END_TOKEN, FishTokenizer
 from fish_speech.utils import autocast_exclude_mps, set_seed
 from tools.file import AUDIO_EXTENSIONS, audio_to_bytes, list_files, read_ref_text
 from tools.llama.generate import (
@@ -412,14 +414,13 @@ from fish_speech.conversation import Conversation, Message
 
 def execute_request(
     input_queue: queue.Queue,
-    tokenizer: AutoTokenizer,
+    tokenizer: FishTokenizer,
     config: BaseModelArgs,
     request: ServeRequest,
     device: str = "cuda:0",
 ):
-    semantic_id, im_end_id = tokenizer.convert_tokens_to_ids(
-        [SEMANTIC_TOKEN, IM_END_TOKEN]
-    )
+
+    im_end_id = tokenizer.get_token_id(IM_END_TOKEN)
     messages = []
     for message in request.messages:
         messages.append(message.to_conversation_message())
@@ -428,7 +429,13 @@ def execute_request(
     # assert messages[-1].role == "user", "The last message must be from the user"
 
     if messages[-1].role == "user":
-        messages.append(Message(role="assistant", parts=[], add_im_end=False))
+        messages.append(
+            Message(role="assistant", parts=[], add_im_end=False, modality="voice")
+        )
+    elif messages[-1].role == "raw":
+        messages[-1].add_im_start = False
+        messages[-1].add_im_end = False
+        messages[-1].modality = "voice"
     else:
         assert (
             messages[-1].role == "assistant"
@@ -436,6 +443,8 @@ def execute_request(
         messages[-1].add_im_end = False
 
     conv = Conversation(messages=messages)
+
+    # conv.visualize(tokenizer)
     prompt = conv.encode_for_inference(
         tokenizer=tokenizer, num_codebooks=config.num_codebooks
     ).to(device)
@@ -453,7 +462,6 @@ def execute_request(
         "prompt": prompt,
         "max_new_tokens": request.max_new_tokens,
         "im_end_id": im_end_id,
-        "semantic_id": semantic_id,
         "temperature": request.temperature,
         "top_p": request.top_p,
         "repetition_penalty": request.repetition_penalty,
@@ -509,10 +517,13 @@ def execute_request(
                     )
                 continue
 
-            if tokens[0] == semantic_id and request.streaming:
+            is_semantic = (
+                tokenizer.semantic_begin_id <= tokens[0] <= tokenizer.semantic_end_id
+            )
+            if is_semantic and request.streaming:
                 yield from send_reset_buffer(sample_id)
                 # Streaming vq
-                _tokens = tokens[1:].clone() - 1
+                _tokens = tokens[1:].clone()
 
                 if config.share_codebook_embeddings is False:
                     for i in range(len(_tokens)):
@@ -525,13 +536,13 @@ def execute_request(
                 continue
 
             # Not streaming vq
-            if tokens[0] == semantic_id:
+            if is_semantic:
                 yield from send_reset_buffer(sample_id)
                 # None streaming vq
                 if len(parts[sample_id]) == 0 or not isinstance(
                     parts[sample_id][-1], ServeVQPart
                 ):
-                    _tokens = tokens[1:].clone() - 1
+                    _tokens = tokens[1:].clone()
 
                     if config.share_codebook_embeddings is False:
                         for i in range(len(_tokens)):
@@ -540,14 +551,14 @@ def execute_request(
                     parts[sample_id].append(ServeVQPart(codes=_tokens.tolist()))
                 else:
                     for codebook_id, value in enumerate(tokens[1:, :]):
-                        val = value.item() - 1
+                        val = value.item()
                         if config.share_codebook_embeddings is False:
                             val -= config.codebook_size * codebook_id
 
                         parts[sample_id][-1].codes[codebook_id].append(val)
                 continue
 
-            if tokens[0] != semantic_id:
+            if not is_semantic:
                 # Stream text decode is not supported now
                 decode_buffer[sample_id].append(tokens[0, 0])
 
@@ -624,8 +635,6 @@ def api_invoke_chat(
 
 @torch.inference_mode()
 def inference(req: ServeTTSRequest):
-
-    global prompt_tokens, prompt_texts
 
     idstr: str | None = req.reference_id
     if idstr is not None:
@@ -1014,7 +1023,6 @@ async def api_health():
     """
     Health check
     """
-
     return JSONResponse({"status": "ok"})
 
 
@@ -1158,7 +1166,7 @@ def initialize_app(app: Kui):
                     max_new_tokens=1000,
                     chunk_length=200,
                     top_p=0.7,
-                    repetition_penalty=1.2,
+                    repetition_penalty=1.5,
                     temperature=0.7,
                     emotion=None,
                     format="wav",
