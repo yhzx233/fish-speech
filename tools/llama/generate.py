@@ -702,36 +702,6 @@ def encode_tokens(
     return encoded.to(device)
 
 
-def encode_tokens_batch(
-    tokenizer,
-    strings: list[str],
-    device="cuda",
-    num_codebooks=4,
-):
-    strings = [clean_text(s) for s in strings]
-    strings = [f"<|im_start|>user\n{s}<|im_end|><|im_start|>assistant\n" for s in strings]
-
-    inputs = tokenizer(
-        strings,
-        add_special_tokens=False,
-        max_length=10**6,
-        truncation=False,
-        padding=True,
-        return_tensors="pt",
-    )
-    tokens = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-
-    # Codebooks
-    zeros = (
-        torch.ones((tokens.size(0), num_codebooks, tokens.size(1)), dtype=torch.int, device=device)
-        * CODEBOOK_PAD_TOKEN_ID
-    )
-    prompt = torch.cat((tokens.unsqueeze(1), zeros), dim=1)
-
-    return prompt, attention_mask
-
-
 def load_model(checkpoint_path, device, precision, compile=False, is_agent=False):
     model: Union[NaiveTransformer, DualARTransformer] = BaseTransformer.from_pretrained(
         checkpoint_path, load_weights=True, is_agent=is_agent
@@ -948,7 +918,7 @@ def generate_long(
 
 def generate_long_batch(
     *,
-    model,
+    model: BaseTransformer,
     device: str | torch.device,
     decode_one_token: callable,
     texts: list[str],
@@ -981,9 +951,24 @@ def generate_long_batch(
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
     tokenizer.padding_side = "left"
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    semantic_id = model.tokenizer.convert_tokens_to_ids("<|semantic|>")
-    pad_id = model.tokenizer.pad_token_id
+    im_end_id = tokenizer.get_token_id("<|im_end|>")
+    semantic_ids = [
+        tokenizer.get_token_id(f"<|semantic:{i}|>") for i in range(1024)
+    ]
+    pad_id = CODEBOOK_PAD_TOKEN_ID
+
+    system_prompt = Conversation(
+        messages=[
+            Message(
+                role="system",
+                parts=[TextPart(text="Speak out the provided text.")],
+                cal_loss=False,
+            )
+        ]
+    ).encode_for_inference(
+        tokenizer=tokenizer,
+        num_codebooks=model.config.num_codebooks,
+    ).to(device)
 
     encoded = []
     # texts = split_text(text, chunk_length) if iterative_prompt else [text]
@@ -1016,9 +1001,11 @@ def generate_long_batch(
             num_codebooks=model.config.num_codebooks,
         )
         if len(encoded_prompts) == 1:
-            encoded_tokens = torch.cat([encoded_prompts[0], encoded_tokens], dim=1)
+            encoded_tokens = torch.cat([system_prompt, encoded_prompts[0], encoded_tokens], dim=1)
         elif len(encoded_prompts) > 1:
-            encoded_tokens = torch.cat([encoded_prompts[idx], encoded_tokens], dim=1)
+            encoded_tokens = torch.cat([system_prompt, encoded_prompts[idx], encoded_tokens], dim=1)
+        else:
+            encoded_tokens = torch.cat([system_prompt, encoded_tokens], dim=1)
         encoded.append(encoded_tokens)
     logger.info(f"Encoded text: {texts}")
     # print(encode_tokens_batch(tokenizer, texts, device=device, num_codebooks=model.config.num_codebooks))
@@ -1062,14 +1049,14 @@ def generate_long_batch(
             prompt=cat_encoded,
             max_new_tokens=max_new_tokens,
             im_end_id=im_end_id,
-            semantic_id=semantic_id,
+            semantic_ids=semantic_ids,
             decode_one_token=decode_one_token,
             num_samples=num_samples,
             early_stop_threshold=1.0,
+            padding_mask=padding_mask,
             temperature=temperature,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
-            padding_mask=padding_mask,
         )
         y = []
         for chunk in generator:
@@ -1108,7 +1095,7 @@ def generate_long_batch(
             im_end_idx = im_end_idx[0] if len(im_end_idx) > 0 else y.size(-1)
             # print('semantic:', y[i, 0, :im_end_idx])
             codes = y[i, 1:, :im_end_idx].clone()
-            codes = codes - 1
+            # codes = codes - 1
             # assert (codes >= 0).all(), f"Negative code found: {codes}"
             # assert (codes < 1000).all(), f"Invalid code found: {codes}"
             if (codes < 0).any() or (codes >= 1000).any():
