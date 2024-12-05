@@ -582,6 +582,13 @@ def generate_agent(
     position_ids = padding_mask.logical_not().cumsum(dim=-1) - 1
     # print(position_ids)
 
+    # Clean up the cache
+    t_0 = time.time()
+    for layer in model.layers:
+        layer.attention.kv_cache.k_cache.fill_(0)
+        layer.attention.kv_cache.v_cache.fill_(0)
+    logger.info(f"Cleaned up cache in {time.time() - t_0:.2f}s")
+
     # Use non-accelerated version for now, to avoid compilation overhead
     prefill_decode = (
         decode_one_token_naive_agent
@@ -1077,6 +1084,7 @@ def generate_long_batch(
             # assert (codes < 1000).all(), f"Invalid code found: {codes}"
             if (codes < 0).any() or (codes >= 1000).any():
                 # 返回空的结果
+                print('Invalid code found:', codes)
                 codes = torch.zeros((codes.shape[0], 0), dtype=torch.int, device=device)
 
             codes = codes.cuda()
