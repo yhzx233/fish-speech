@@ -171,7 +171,9 @@ def decode_one_token_ar_agent(
     codebooks = [
         sample_agent(
             logits,
-            previous_tokens=None,  # Disable repetition penalty for the token codebook
+            previous_tokens=(
+                previous_tokens[:, 0] if previous_tokens is not None else None
+            ),  # Disable repetition penalty for the token codebook
             **sampling_kwargs_main,
         )[0]
     ]
@@ -1128,6 +1130,7 @@ def launch_thread_safe_queue(
     precision,
     compile: bool = False,
     max_batch_size: int = 64,
+    max_seq_len: Optional[int] = None,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
@@ -1136,6 +1139,8 @@ def launch_thread_safe_queue(
         model, decode_one_token = load_model(
             checkpoint_path, device, precision, compile=compile
         )
+        if max_seq_len is not None:
+            model.config.max_seq_len = max_seq_len
         with torch.device(device):
             model.setup_caches(
                 max_batch_size=max_batch_size,

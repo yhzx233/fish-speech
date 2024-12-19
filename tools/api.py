@@ -759,7 +759,7 @@ def inference(req: ServeTTSRequest):
 
 
 @cached(
-    cache=LRUCache(maxsize=10000),
+    cache=LRUCache(maxsize=100000),
     key=lambda path, decoder_model: path,
 )
 def get_prompt_token_and_text(ref_audio_path: str, decoder_model):
@@ -777,6 +777,7 @@ def get_prompt_token_and_text(ref_audio_path: str, decoder_model):
     if cache_path.exists():
         # 从缓存加载
         prompt_token = torch.from_numpy(np.load(cache_path)).to(decoder_model.device)
+        logger.info(f"Loaded prompt token from cache: {cache_path}")
     else:
         # 计算并缓存
         prompt_token = encode_reference(
@@ -790,6 +791,13 @@ def get_prompt_token_and_text(ref_audio_path: str, decoder_model):
     prompt_text = read_ref_text(str(ref_audio.with_suffix(".lab")))
     
     return prompt_token, prompt_text
+
+    
+@cached(
+    cache=LRUCache(maxsize=100000)
+)
+def cached_list_files(folder):
+    return list_files(folder, AUDIO_EXTENSIONS, recursive=True, sort=False)
 
 
 @torch.inference_mode()
@@ -811,9 +819,7 @@ def inference_batch(req: ServeTTSBatchRequest):
     for idstr in ids_str:
         ref_folder = Path(args.reference_path) / idstr
         ref_folder.mkdir(parents=True, exist_ok=True)
-        ref_audios = list_files(
-            ref_folder, AUDIO_EXTENSIONS, recursive=True, sort=False
-        )[:1] # 先只拿前三个
+        ref_audios = cached_list_files(ref_folder) # 先只拿前三个
 
         if req.use_memory_cache == "never" or (
             req.use_memory_cache == "on-demand" and len(prompt_tokens) == 0
@@ -1132,6 +1138,7 @@ def initialize_app(app: Kui):
             precision=args.precision,
             compile=args.compile,
             max_batch_size=args.max_batch_size,
+            max_seq_len=2048,
         )
     else:
         llama_queue, tokenizer, config = launch_thread_safe_queue_agent(
